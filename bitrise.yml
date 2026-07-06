@@ -84,9 +84,7 @@ workflows:
             - key: $BUNDLE_HASH_STRING
             - paths: |-
                 dist
-                android/app/build/outputs
-                android/build
-                android/.gradle
+                android
       - deploy-to-bitrise-io@2: {}
     meta:
       bitrise.io:
