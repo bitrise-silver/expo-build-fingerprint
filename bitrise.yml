@@ -37,7 +37,7 @@ workflows:
                 package-lock.json
             - key_prefix: expo-build-skip
             - verbose: "true"
-      - restore-cache@2:
+      - restore-cache@3:
           title: Restore cached Expo export
           inputs:
             - key: $BUNDLE_HASH_STRING
@@ -59,7 +59,7 @@ workflows:
                 set -euo pipefail
                 echo "Cache hit (BITRISE_CACHE_HIT=$BITRISE_CACHE_HIT, key=$BUNDLE_HASH_STRING) — skipping expo export."
                 ls -lh dist || true
-      - save-cache@2:
+      - save-cache@1:
           title: Save Expo export for next time (cache miss only)
           run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
           inputs:
