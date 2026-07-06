@@ -5,23 +5,23 @@ project_type: react-native
 
 trigger_map:
   - push_branch: "*"
-    workflow: build_or_skip
+    workflow: build_fingerprint
   - pull_request_target_branch: "*"
-    workflow: build_or_skip
+    workflow: build_fingerprint
 
 workflows:
-  build_or_skip:
+  build_fingerprint:
     summary: |
-      Fingerprints the dependency files, restores any cached Expo export, and only
-      re-exports when the dependencies actually changed (cache miss).
+      Fingerprints the dependency files into a cache key, checks whether that key is
+      already cached, and only runs `expo export` on a cache miss.
     description: |
       Demonstrates the free Bitrise key-value cache "build skip" pattern for Expo:
-        1. restore-cache pulls a previous `expo export` output (dist/) keyed by the dep checksum.
-        2. steps-react-native-fingerprint fingerprints the deps and sets BUNDLE_HASH_STRING
-           (non-empty only when the cached export is present).
-        3. `expo export` runs only on a miss; the export is saved for next time.
-      When only App.tsx changes, the dependency fingerprint is unchanged, so subsequent
-      builds hit the cache and skip re-exporting.
+        1. steps-react-native-fingerprint fingerprints the deps into BUNDLE_HASH_STRING and
+           checks the key-value cache for that key (without downloading), setting BUNDLE_CACHE_FOUND.
+        2. restore-cache pulls the cached export only when BUNDLE_CACHE_FOUND is "true".
+        3. `expo export` runs only on a miss; the export is saved under BUNDLE_HASH_STRING.
+      When only App.tsx changes, the dependency fingerprint is unchanged, so subsequent builds
+      find the key and skip re-exporting.
     steps:
       - git-clone@8: {}
       - restore-npm-cache@2: {}
@@ -30,22 +30,22 @@ workflows:
           inputs:
             - command: ci
       - save-npm-cache@1: {}
-      - restore-cache@2:
-          title: Restore cached Expo export
-          inputs:
-            - key: expo-build-skip-{{ checksum "package.json" "package-lock.json" }}
       - git::https://github.com/bitrise-silver/steps-react-native-fingerprint.git@main:
-          title: Detect prebuilt Expo export
+          title: Fingerprint deps → cache key + hit check
           inputs:
             - file_paths: |-
                 package.json
                 package-lock.json
-            - artifact_path: dist
             - key_prefix: expo-build-skip
             - verbose: "true"
+      - restore-cache@2:
+          title: Restore cached Expo export (only if found)
+          run_if: '{{ enveq "BUNDLE_CACHE_FOUND" "true" }}'
+          inputs:
+            - key: $BUNDLE_HASH_STRING
       - script@1:
           title: Expo export (cache miss only)
-          run_if: '{{ enveq "BUNDLE_HASH_STRING" "" }}'
+          run_if: '{{ enveq "BUNDLE_CACHE_FOUND" "false" }}'
           inputs:
             - content: |-
                 #!/usr/bin/env bash
@@ -54,18 +54,18 @@ workflows:
                 npx expo export --platform ios --output-dir dist
       - script@1:
           title: Reuse cached Expo export (cache hit only)
-          run_if: '{{ not (enveq "BUNDLE_HASH_STRING" "") }}'
+          run_if: '{{ enveq "BUNDLE_CACHE_FOUND" "true" }}'
           inputs:
             - content: |-
                 #!/usr/bin/env bash
                 set -euo pipefail
-                echo "Cache hit (BUNDLE_HASH_STRING=$BUNDLE_HASH_STRING) — skipping expo export."
+                echo "Cache hit (key=$BUNDLE_HASH_STRING) — skipping expo export."
                 ls -lh dist || true
       - save-cache@2:
-          title: Save Expo export for next time
-          run_if: '{{ enveq "BUNDLE_HASH_STRING" "" }}'
+          title: Save Expo export for next time (cache miss only)
+          run_if: '{{ enveq "BUNDLE_CACHE_FOUND" "false" }}'
           inputs:
-            - key: expo-build-skip-{{ checksum "package.json" "package-lock.json" }}
+            - key: $BUNDLE_HASH_STRING
             - paths: dist
       - deploy-to-bitrise-io@2: {}
     meta:
