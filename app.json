@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "expo-build-fingerprint-demo",
-    "slug": "expo-build-fingerprint-demo",
+    "slug": "bitrise-demo",
     "version": "1.0.0",
     "platforms": [
       "ios",
@@ -16,6 +16,12 @@
     },
     "android": {
       "package": "io.bitrise.silver.expobuildfingerprint"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "bbae1215-5c20-4b2f-9ff2-2a8ac6fdf78b"
+      }
+    },
+    "owner": "silvercast-bitrise"
   }
 }
