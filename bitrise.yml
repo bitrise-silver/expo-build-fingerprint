@@ -182,7 +182,7 @@ workflows:
 
       # ---------------- MISS: full simulator build ----------------
       - script@1:
-          title: "[miss] Expo prebuild (iOS) + detect workspace/scheme"
+          title: "[miss] Expo prebuild (iOS)"
           run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
           inputs:
             - content: |-
@@ -196,6 +196,19 @@ workflows:
                 envman add --key BITRISE_SCHEME --value "$(basename "$WS" .xcworkspace)"
       - cocoapods-install@2:
           run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+      - script@1:
+          title: "[miss] Detect workspace + scheme (after CocoaPods)"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                # CocoaPods generates the .xcworkspace, so detect it AFTER pod install
+                # (expo prebuild --no-install only creates the .xcodeproj).
+                WS="$(ls -d ios/*.xcworkspace | head -1)"
+                envman add --key BITRISE_PROJECT_PATH --value "$WS"
+                envman add --key BITRISE_SCHEME --value "$(basename "$WS" .xcworkspace)"
+                echo "Workspace: $WS  |  Scheme: $(basename "$WS" .xcworkspace)"
       - xcode-build-for-simulator@3:
           title: "[miss] Build .app for iOS Simulator"
           run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
@@ -298,7 +311,7 @@ workflows:
 
       # ---------------- MISS: full simulator build, accelerated by Bitrise Build Cache ----------------
       - script@1:
-          title: "[miss] Expo prebuild (iOS) + detect workspace/scheme"
+          title: "[miss] Expo prebuild (iOS)"
           run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
           inputs:
             - content: |-
@@ -306,11 +319,21 @@ workflows:
                 set -euo pipefail
                 echo "Cache MISS — generating the native iOS project…"
                 npx expo prebuild --platform ios --no-install
+      - cocoapods-install@2:
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+      - script@1:
+          title: "[miss] Detect workspace + scheme (after CocoaPods)"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                # CocoaPods generates the .xcworkspace, so detect it AFTER pod install
+                # (expo prebuild --no-install only creates the .xcodeproj).
                 WS="$(ls -d ios/*.xcworkspace | head -1)"
                 envman add --key BITRISE_PROJECT_PATH --value "$WS"
                 envman add --key BITRISE_SCHEME --value "$(basename "$WS" .xcworkspace)"
-      - cocoapods-install@2:
-          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+                echo "Workspace: $WS  |  Scheme: $(basename "$WS" .xcworkspace)"
       - activate-build-cache-for-react-native@0:
           title: "[miss] Activate Bitrise Build Cache for React Native"
           run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
