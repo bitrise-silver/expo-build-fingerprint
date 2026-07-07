@@ -8,12 +8,16 @@ tools:
 
 trigger_map:
   - push_branch: "*"
-    workflow: build_fingerprint
+    workflow: build_android_fingerprint
   - pull_request_target_branch: "*"
-    workflow: build_fingerprint
+    workflow: build_android_fingerprint
 
 workflows:
-  build_fingerprint:
+
+  # ==========================================================================================
+  # Android — fingerprint-based native-skip (DIY, free key-value cache)
+  # ==========================================================================================
+  build_android_fingerprint:
     summary: |
       Fingerprints the NATIVE build inputs. On a cache hit it reuses the prebuilt APK by swapping
       in a freshly built JS bundle and re-signing — skipping the slow Gradle build entirely.
@@ -44,7 +48,7 @@ workflows:
                 package.json
                 package-lock.json
                 app.json
-            - key_prefix: build-fingerprint
+            - key_prefix: build-fingerprint-android
             - verbose: "true"
       - restore-cache@3:
           title: Restore cached APK (native build)
@@ -140,3 +144,228 @@ workflows:
       bitrise.io:
         stack: ubuntu-noble-24.04-bitrise-2025-android
         machine_type_id: g2.linux.large
+
+  # ==========================================================================================
+  # iOS — fingerprint-based native-skip (DIY). Simulator build → no code signing needed.
+  # ==========================================================================================
+  build_ios_fingerprint:
+    summary: |
+      iOS twin of build_android_fingerprint. On a cache hit it reuses the cached simulator .app by
+      swapping in a freshly built JS bundle — skipping the Xcode build entirely. Simulator build,
+      so no certificates or provisioning profiles are required.
+    description: |
+      1. Fingerprint the native inputs → BUNDLE_HASH_STRING (JS excluded).
+      2. restore-cache reports BITRISE_CACHE_HIT.
+      3. MISS → expo prebuild (iOS) + pod install + xcode-build-for-simulator; cache the .app.
+      4. HIT  → rebuild ONLY the JS bundle (Hermes), swap main.jsbundle inside the cached .app. No Xcode.
+    steps:
+      - git-clone@8: {}
+      - restore-npm-cache@3: {}
+      - npm@3:
+          title: npm ci
+          inputs:
+            - command: ci
+      - save-npm-cache@1: {}
+      - git::https://github.com/bitrise-silver/steps-react-native-fingerprint.git@main:
+          title: Fingerprint native inputs → cache key
+          inputs:
+            - file_paths: |-
+                package.json
+                package-lock.json
+                app.json
+            - key_prefix: build-fingerprint-ios
+            - verbose: "true"
+      - restore-cache@3:
+          title: Restore cached simulator .app
+          inputs:
+            - key: $BUNDLE_HASH_STRING
+
+      # ---------------- MISS: full simulator build ----------------
+      - script@1:
+          title: "[miss] Expo prebuild (iOS) + detect workspace/scheme"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                echo "Cache MISS — generating the native iOS project…"
+                npx expo prebuild --platform ios --no-install
+                # Workspace and scheme names derive from app.json; discover them for the build step.
+                WS="$(ls -d ios/*.xcworkspace | head -1)"
+                envman add --key BITRISE_PROJECT_PATH --value "$WS"
+                envman add --key BITRISE_SCHEME --value "$(basename "$WS" .xcworkspace)"
+      - cocoapods-install@2:
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+      - xcode-build-for-simulator@3:
+          title: "[miss] Build .app for iOS Simulator"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - configuration: Release
+            - output_dir: _iosbuild
+      - script@1:
+          title: "[miss] Cache the simulator .app"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                mkdir -p _nativecache
+                rm -rf _nativecache/app.app
+                # BITRISE_APP_DIR_PATH is exported by xcode-build-for-simulator.
+                cp -R "$BITRISE_APP_DIR_PATH" _nativecache/app.app
+                ( cd _nativecache && zip -qry "$BITRISE_DEPLOY_DIR/app-sim.zip" app.app )
+                echo "Cached simulator .app ($(du -sh _nativecache/app.app | cut -f1))."
+      - save-cache@1:
+          title: "[miss] Save simulator .app for next time"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - key: $BUNDLE_HASH_STRING
+            - paths: _nativecache
+
+      # ---------------- HIT: reuse .app, swap JS bundle (fast) ----------------
+      - script@1:
+          title: "[hit] Swap JS bundle into cached .app (skip Xcode)"
+          run_if: '{{ not (enveq "BITRISE_CACHE_HIT" "false") }}'
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                echo "Cache HIT — refreshing the JS bundle inside the cached .app (no Xcode)."
+                APP="_nativecache/app.app"
+
+                # Rebuild only the JS bundle (same command the native build embeds), for iOS.
+                npx expo export:embed \
+                  --platform ios \
+                  --dev false \
+                  --entry-file index.ts \
+                  --bundle-output "$APP/main.jsbundle" \
+                  --assets-dest "$APP"
+
+                # Expo/RN default to Hermes → compile to bytecode (macOS hermesc).
+                HERMESC="node_modules/react-native/sdks/hermesc/osx-bin/hermesc"
+                if [ -x "$HERMESC" ]; then
+                  echo "Hermes enabled — compiling bundle to bytecode…"
+                  "$HERMESC" -emit-binary -O -out "$APP/main.jsbundle.hbc" "$APP/main.jsbundle"
+                  mv "$APP/main.jsbundle.hbc" "$APP/main.jsbundle"
+                fi
+
+                # Simulator apps aren't code-signed, so no re-signing is needed — just repackage.
+                ( cd _nativecache && zip -qry "$BITRISE_DEPLOY_DIR/app-sim.zip" app.app )
+                echo "Swapped JS bundle into the cached .app (Xcode build skipped)."
+
+      - deploy-to-bitrise-io@2: {}
+    meta:
+      bitrise.io:
+        stack: osx-xcode-16.4.x
+        machine_type_id: g2.mac.large
+
+  # ==========================================================================================
+  # iOS — same fingerprint skip, but the full (miss) build is accelerated by the MANAGED
+  # Bitrise Build Cache for React Native (Xcode compilation cache). Needs Xcode 26+ and an
+  # active Build Cache trial/subscription on the workspace.
+  # ==========================================================================================
+  build_ios_cache_fingerprint:
+    summary: |
+      Same as build_ios_fingerprint (JS-only changes hit the cache and swap the bundle), but the
+      full build on a miss is accelerated by Bitrise Build Cache for React Native — so even a
+      dependency change rebuilds faster instead of a cold Xcode compile.
+    description: |
+      HIT (JS-only)   → swap main.jsbundle into the cached .app (no Xcode), identical to build_ios_fingerprint.
+      MISS (rebuild)  → activate-build-cache-for-react-native starts the Xcode cache proxy, then
+                        xcode-build-for-simulator compiles with cached compiler outputs (much faster
+                        than a cold build). The resulting .app is cached for the JS-only fast path.
+    steps:
+      - git-clone@8: {}
+      - restore-npm-cache@3: {}
+      - npm@3:
+          title: npm ci
+          inputs:
+            - command: ci
+      - save-npm-cache@1: {}
+      - git::https://github.com/bitrise-silver/steps-react-native-fingerprint.git@main:
+          title: Fingerprint native inputs → cache key
+          inputs:
+            - file_paths: |-
+                package.json
+                package-lock.json
+                app.json
+            - key_prefix: build-fingerprint-ios-cache
+            - verbose: "true"
+      - restore-cache@3:
+          title: Restore cached simulator .app
+          inputs:
+            - key: $BUNDLE_HASH_STRING
+
+      # ---------------- MISS: full simulator build, accelerated by Bitrise Build Cache ----------------
+      - script@1:
+          title: "[miss] Expo prebuild (iOS) + detect workspace/scheme"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                echo "Cache MISS — generating the native iOS project…"
+                npx expo prebuild --platform ios --no-install
+                WS="$(ls -d ios/*.xcworkspace | head -1)"
+                envman add --key BITRISE_PROJECT_PATH --value "$WS"
+                envman add --key BITRISE_SCHEME --value "$(basename "$WS" .xcworkspace)"
+      - cocoapods-install@2:
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+      - activate-build-cache-for-react-native@0:
+          title: "[miss] Activate Bitrise Build Cache for React Native"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+      - xcode-build-for-simulator@3:
+          title: "[miss] Build .app for iOS Simulator (Build Cache accelerated)"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - configuration: Release
+            - output_dir: _iosbuild
+      - script@1:
+          title: "[miss] Cache the simulator .app"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                mkdir -p _nativecache
+                rm -rf _nativecache/app.app
+                cp -R "$BITRISE_APP_DIR_PATH" _nativecache/app.app
+                ( cd _nativecache && zip -qry "$BITRISE_DEPLOY_DIR/app-sim.zip" app.app )
+                echo "Cached simulator .app ($(du -sh _nativecache/app.app | cut -f1))."
+      - save-cache@1:
+          title: "[miss] Save simulator .app for next time"
+          run_if: '{{ enveq "BITRISE_CACHE_HIT" "false" }}'
+          inputs:
+            - key: $BUNDLE_HASH_STRING
+            - paths: _nativecache
+
+      # ---------------- HIT: reuse .app, swap JS bundle (fast) ----------------
+      - script@1:
+          title: "[hit] Swap JS bundle into cached .app (skip Xcode)"
+          run_if: '{{ not (enveq "BITRISE_CACHE_HIT" "false") }}'
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                echo "Cache HIT — refreshing the JS bundle inside the cached .app (no Xcode)."
+                APP="_nativecache/app.app"
+                npx expo export:embed \
+                  --platform ios \
+                  --dev false \
+                  --entry-file index.ts \
+                  --bundle-output "$APP/main.jsbundle" \
+                  --assets-dest "$APP"
+                HERMESC="node_modules/react-native/sdks/hermesc/osx-bin/hermesc"
+                if [ -x "$HERMESC" ]; then
+                  echo "Hermes enabled — compiling bundle to bytecode…"
+                  "$HERMESC" -emit-binary -O -out "$APP/main.jsbundle.hbc" "$APP/main.jsbundle"
+                  mv "$APP/main.jsbundle.hbc" "$APP/main.jsbundle"
+                fi
+                ( cd _nativecache && zip -qry "$BITRISE_DEPLOY_DIR/app-sim.zip" app.app )
+                echo "Swapped JS bundle into the cached .app (Xcode build skipped)."
+
+      - deploy-to-bitrise-io@2: {}
+    meta:
+      bitrise.io:
+        stack: osx-xcode-26.6.x
+        machine_type_id: g2.mac.large
